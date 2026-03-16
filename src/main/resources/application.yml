@@ -1,0 +1,56 @@
+langchain4j:
+  open-ai:
+    chat-model:
+      base-url: https://dashscope.aliyuncs.com/compatible-mode/v1
+      api-key: ${API_KEY}
+      model-name: qwen-plus
+      log-requests: true
+      log-responses: true
+    streaming-chat-model:
+      base-url: https://dashscope.aliyuncs.com/compatible-mode/v1
+      api-key: ${API_KEY}
+      model-name: qwen-plus
+      log-requests: true
+      log-responses: true
+    embedding-model:
+      base-url: https://dashscope.aliyuncs.com/compatible-mode/v1
+      api-key: ${API_KEY}
+      model-name: text-embedding-v3
+      log-requests: true
+      log-responses: true
+      max-segments-per-batch: 10
+
+  community:
+    redis:
+      host: localhost
+      port: 6379
+      password: "123"
+      user: default
+logging:
+  level:
+    dev.langchain4j: debug
+
+spring:
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      password: 123
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://localhost:3306/volunteer?serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true&characterEncoding=UTF-8
+    username: root
+    password: 123456
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: root
+    password: 123456
+    listener:
+      simple:
+        acknowledge-mode: manual  # 必须显式声明为手动，否则代码里的 Ack 会报错
+        retry:
+          enabled: false          # 如果使用手动确认，建议关闭 Spring 默认的重试，改用 Nack 的 requue
+mybatis:
+  configuration:
+    map-underscore-to-camel-case: true

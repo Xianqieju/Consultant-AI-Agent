@@ -1,0 +1,8 @@
+/target/
+*.class
+.idea/
+*.iml
+# 重点：不要上传包含敏感信息的配置文件
+application-dev.yml
+application-local.yml
+.env

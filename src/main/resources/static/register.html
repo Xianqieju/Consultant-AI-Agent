@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>注册 - AI志愿填报顾问</title>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/vue@3.2.31/dist/vue.global.min.js"></script>
+    <style>
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+        }
+        .register-card {
+            transition: all 0.3s ease;
+        }
+    </style>
+</head>
+<body class="bg-gray-50">
+<div id="app" :class="['min-h-screen flex flex-col', darkMode ? 'bg-gray-900' : 'bg-gray-50']">
+    <header :class="['py-4 px-6 shadow-sm flex items-center justify-between', darkMode ? 'bg-gray-800' : 'bg-white']">
+        <div class="flex items-center cursor-pointer" @click="goBack">
+            <i class="fas fa-chevron-left mr-2 text-gray-400"></i>
+            <div class="text-xl font-bold text-blue-600">AI志愿填报顾问</div>
+        </div>
+        <button @click="toggleDarkMode" class="p-2 rounded-full hover:bg-gray-100 transition-colors">
+            <i :class="darkMode ? 'fas fa-moon text-gray-300' : 'fas fa-sun text-gray-600'"></i>
+        </button>
+    </header>
+
+    <main class="flex-1 flex items-center justify-center p-4">
+        <div :class="['max-w-md w-full rounded-2xl shadow-xl p-8 register-card', darkMode ? 'bg-gray-800 border border-gray-700' : 'bg-white']">
+            <div class="text-center mb-6">
+                <h2 :class="['text-2xl font-bold', darkMode ? 'text-white' : 'text-gray-800']">创建新账号</h2>
+                <p :class="['mt-2 text-sm', darkMode ? 'text-gray-400' : 'text-gray-500']">加入我们，开启智能志愿填报之旅</p>
+            </div>
+
+            <form @submit.prevent="handleRegister" class="space-y-4">
+                <div>
+                    <label class="block text-sm font-medium mb-1" :class="darkMode ? 'text-gray-300' : 'text-gray-700'">用户名</label>
+                    <div class="relative">
+                        <span class="absolute inset-y-0 left-0 pl-3 flex items-center text-gray-400">
+                            <i class="fas fa-user"></i>
+                        </span>
+                        <input
+                                v-model="form.username"
+                                type="text"
+                                required
+                                placeholder="设置您的登录账号"
+                                :class="['w-full pl-10 pr-4 py-3 border rounded-xl focus:ring-2 outline-none transition-all',
+                                     darkMode ? 'bg-gray-700 border-gray-600 text-white focus:ring-blue-500' : 'bg-white border-gray-200 focus:ring-blue-400']">
+                    </div>
+                </div>
+
+                <div>
+                    <label class="block text-sm font-medium mb-1" :class="darkMode ? 'text-gray-300' : 'text-gray-700'">个性昵称</label>
+                    <div class="relative">
+                        <span class="absolute inset-y-0 left-0 pl-3 flex items-center text-gray-400">
+                            <i class="fas fa-id-card"></i>
+                        </span>
+                        <input
+                                v-model="form.nickname"
+                                type="text"
+                                required
+                                placeholder="怎么称呼您？"
+                                :class="['w-full pl-10 pr-4 py-3 border rounded-xl focus:ring-2 outline-none transition-all',
+                                     darkMode ? 'bg-gray-700 border-gray-600 text-white focus:ring-blue-500' : 'bg-white border-gray-200 focus:ring-blue-400']">
+                    </div>
+                </div>
+
+                <div>
+                    <label class="block text-sm font-medium mb-1" :class="darkMode ? 'text-gray-300' : 'text-gray-700'">手机号码</label>
+                    <div class="relative">
+                        <span class="absolute inset-y-0 left-0 pl-3 flex items-center text-gray-400">
+                            <i class="fas fa-mobile-alt"></i>
+                        </span>
+                        <input
+                                v-model="form.phone"
+                                type="tel"
+                                required
+                                placeholder="11位手机号码"
+                                :class="['w-full pl-10 pr-4 py-3 border rounded-xl focus:ring-2 outline-none transition-all',
+                                     darkMode ? 'bg-gray-700 border-gray-600 text-white focus:ring-blue-500' : 'bg-white border-gray-200 focus:ring-blue-400']">
+                    </div>
+                </div>
+
+                <div>
+                    <label class="block text-sm font-medium mb-1" :class="darkMode ? 'text-gray-300' : 'text-gray-700'">登录密码</label>
+                    <div class="relative">
+                        <span class="absolute inset-y-0 left-0 pl-3 flex items-center text-gray-400">
+                            <i class="fas fa-lock"></i>
+                        </span>
+                        <input
+                                v-model="form.password"
+                                :type="showPassword ? 'text' : 'password'"
+                                required
+                                placeholder="设置强密码保护账号"
+                                :class="['w-full pl-10 pr-12 py-3 border rounded-xl focus:ring-2 outline-none transition-all',
+                                     darkMode ? 'bg-gray-700 border-gray-600 text-white focus:ring-blue-500' : 'bg-white border-gray-200 focus:ring-blue-400']">
+                        <button type="button" @click="showPassword = !showPassword" class="absolute inset-y-0 right-0 pr-3 flex items-center text-gray-400 hover:text-gray-600">
+                            <i :class="showPassword ? 'fas fa-eye-slash' : 'fas fa-eye'"></i>
+                        </button>
+                    </div>
+                </div>
+
+                <div class="pt-2">
+                    <button
+                            type="submit"
+                            :disabled="isSubmitting"
+                            class="w-full py-3 bg-blue-600 text-white rounded-xl font-bold hover:bg-blue-700 transition-all shadow-lg shadow-blue-200 disabled:opacity-70 flex items-center justify-center">
+                        <i v-if="isSubmitting" class="fas fa-circle-notch fa-spin mr-2"></i>
+                        {{ isSubmitting ? '正在注册...' : '立即注册' }}
+                    </button>
+                </div>
+            </form>
+
+            <div class="mt-8 text-center border-t pt-6" :class="darkMode ? 'border-gray-700' : 'border-gray-100'">
+                <p :class="['text-sm', darkMode ? 'text-gray-400' : 'text-gray-600']">
+                    已有账号?
+                    <a href="/login.html" class="text-blue-600 font-bold hover:underline">返回登录</a>
+                </p>
+            </div>
+        </div>
+    </main>
+</div>
+
+<script>
+    const { createApp, ref, onMounted } = Vue;
+
+    createApp({
+        setup() {
+            const darkMode = ref(false);
+            const showPassword = ref(false);
+            const isSubmitting = ref(false);
+
+            const form = ref({
+                username: '',
+                nickname: '',
+                phone: '',
+                password: ''
+            });
+
+            const toggleDarkMode = () => {
+                darkMode.value = !darkMode.value;
+                localStorage.setItem('darkMode', darkMode.value);
+            };
+
+            const goBack = () => {
+                window.location.href = '/';
+            };
+
+            const handleRegister = async () => {
+                // 简单的客户端验证
+                if (!form.value.username || !form.value.password || !form.value.phone || !form.value.nickname) {
+                    alert("请填写完整的注册信息");
+                    return;
+                }
+
+                if (form.value.phone.length !== 11) {
+                    alert("请输入正确的11位手机号");
+                    return;
+                }
+
+                isSubmitting.value = true;
+
+                try {
+                    // 发送注册请求
+                    const response = await fetch('/user/register', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(form.value),
+                        credentials: 'include'
+                    });
+
+                    if (response.ok) {
+                        const result = await response.json();
+                        if (result.success) {
+                            alert("注册成功！即将前往登录。");
+                            window.location.href = '/login.html';
+                        } else {
+                            alert("注册失败: " + (result.errorMsg || "该账号或手机号可能已被占用"));
+                        }
+                    } else {
+                        alert("服务器异常，响应码：" + response.status);
+                    }
+                } catch (error) {
+                    console.error("注册请求出错:", error);
+                    alert("网络异常，请确保后端服务已启动并允许跨域");
+                } finally {
+                    isSubmitting.value = false;
+                }
+            };
+
+            onMounted(() => {
+                darkMode.value = localStorage.getItem('darkMode') === 'true' ||
+                    (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+            });
+
+            return {
+                darkMode,
+                showPassword,
+                isSubmitting,
+                form,
+                toggleDarkMode,
+                goBack,
+                handleRegister
+            };
+        }
+    }).mount('#app');
+</script>
+</body>
+</html>
