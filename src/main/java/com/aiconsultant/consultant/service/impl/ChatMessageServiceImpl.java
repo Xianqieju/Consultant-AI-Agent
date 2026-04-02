@@ -1,15 +1,12 @@
 package com.aiconsultant.consultant.service.impl;
 
+import com.aiconsultant.consultant.pojo.*;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.aiconsultant.consultant.aiservice.*;
 import com.aiconsultant.consultant.config.RabbitMQConfig;
 import com.aiconsultant.consultant.entity.ChatMessage;
 import com.aiconsultant.consultant.mapper.ChatMessageMapper;
-import com.aiconsultant.consultant.pojo.ChatAgentDTO;
-import com.aiconsultant.consultant.pojo.ChatMessageDTO;
-import com.aiconsultant.consultant.pojo.QuotaOperationDTO;
-import com.aiconsultant.consultant.pojo.Result;
 import com.aiconsultant.consultant.registry.DynamicToolRegistry;
 import com.aiconsultant.consultant.service.ChatAgentService;
 import com.aiconsultant.consultant.service.ChatMessageService;
@@ -25,9 +22,11 @@ import dev.langchain4j.memory.chat.ChatMemoryProvider;
 import dev.langchain4j.model.openai.OpenAiStreamingChatModel;
 import dev.langchain4j.service.AiServices;
 import lombok.extern.slf4j.Slf4j;
+import org.redisson.api.RBloomFilter;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import reactor.core.publisher.BufferOverflowStrategy;
 import reactor.core.publisher.Flux;
 
 import java.util.ArrayList;
@@ -68,6 +67,8 @@ public class ChatMessageServiceImpl extends ServiceImpl<ChatMessageMapper, ChatM
     private DynamicToolRegistry dynamicToolRegistry;
     @Autowired
     private OpenAiStreamingChatModel openAiStreamingChatModel;
+    @Autowired
+    private RBloomFilter<String> sessionBloomFilter;
 
     private Flux<String> routeAndExecuteChat(
             Long sessionId, String message, String dynamicPrompt,
@@ -104,71 +105,98 @@ public class ChatMessageServiceImpl extends ServiceImpl<ChatMessageMapper, ChatM
             // 发起流式对话
             aiResponseFlux = dynamicAgent.chat(sessionId, message, dynamicPrompt);
         }
+        Flux<String> protectedFlux = aiResponseFlux
+                // 1. 【限流请求】告诉上游：“每次只给我发 10 个 Token，我处理完了你再发下一批”
+                .limitRate(10)
+                // 2. 【溢出保护】如果底层 SDK 不支持背压（盲目硬推），我们在内存最多缓冲 256 个元素。
+                // 如果超过 256 个，采取 ERROR 策略（直接熔断报错），宁可中断对话，也不让 OOM 拖垮整个节点。
+                .onBackpressureBuffer(256, BufferOverflowStrategy.ERROR);
 
         // 3. 统一挂载响应式钩子 (MQ 落库 & TCC 确认/回滚)
         StringBuilder aiContentBuilder = new StringBuilder();
+        // 2. 将原始流转化为“共享流”，autoConnect(2) 表示当有 2 个订阅者时（前端+后端）才真正开始请求 AI
+// 这样可以确保后端手动订阅和前端 HTTP 订阅拿到的是同一份数据，且不重复调用 AI
 
-        return aiResponseFlux
-                .doOnNext(aiContentBuilder::append)
-                .doOnComplete(() -> {
-                    String fullAiResponse = aiContentBuilder.toString();
-                    log.info("AI 流生成完毕，准备执行 MQ 落库与 TCC 确认。");
+        Flux<String> sharedFlux = protectedFlux.publish().autoConnect(2);
 
-                    // 过滤掉思考过程的脏文本（如果存在）
-                    String cleanContent = fullAiResponse
-                            .replaceAll("(?m)^(思考|行动|观察|Action)：.*$", "")
-                            .replaceAll("\\n+", "\n")
-                            .trim();
-
-                    // 异步投递【AI回复】到 MQ (落库)
-                    ChatMessageDTO aiMsgDTO = new ChatMessageDTO();
-                    aiMsgDTO.setId(aiMsgId);
-                    aiMsgDTO.setUserId(userId);
-                    aiMsgDTO.setSessionId(sessionId);
-                    aiMsgDTO.setRole(1);
-                    aiMsgDTO.setContent(cleanContent); // 使用清理后的文本
-                    aiMsgDTO.setCorrelationId(txId);
-                    aiMsgDTO.setStatus(0);
-                    rabbitTemplate.convertAndSend(RabbitMQConfig.CHAT_EXCHANGE, RabbitMQConfig.CHAT_ROUTING_KEY, aiMsgDTO);
-
-                    // TCC 阶段二：Confirm (触发异步实扣)
-                    QuotaOperationDTO confirmDto = new QuotaOperationDTO();
-                    confirmDto.setTxId(txId);
-                    confirmDto.setChatId(aiMsgId);
-                    confirmDto.setUserId(userId);
-                    confirmDto.setAmount(costAmount);
-                    rabbitTemplate.convertAndSend("quota.direct", "confirm", confirmDto);
-                })
-                .doOnError(error -> {
+// 3. 【核心改动】后端手动订阅：这就像开启了一个后台任务，它不随 HTTP 连接断开而停止
+        // 3. 【核心改动】后端手动订阅：这就像开启了一个后台任务，它不随 HTTP 连接断开而停止
+        sharedFlux.subscribe(
+                content -> aiContentBuilder.append(content), // doOnNext 的替代
+                error -> {
+                    // doOnError 的逻辑搬到这里
                     log.error("AI 对话生成流异常, 触发额度回滚。userId: {}, txId: {}", userId, txId, error);
-
-                    // TCC 阶段三：Cancel (触发异步回滚)
                     QuotaOperationDTO cancelDto = new QuotaOperationDTO();
                     cancelDto.setTxId(txId);
                     cancelDto.setChatId(aiMsgId);
                     cancelDto.setUserId(userId);
                     cancelDto.setAmount(costAmount);
                     rabbitTemplate.convertAndSend("quota.direct", "cancel", cancelDto);
-                });
+                },
+                () -> {
+                    // doOnComplete 的逻辑搬到这里
+                    String fullAiResponse = aiContentBuilder.toString();
+                    log.info("AI 任务完整结束（不受前端断连影响），准备查验墓碑与落库。txId: {}", txId);
+
+                    // 【核心新增：防白嫖与防悬挂的最终物理防线】
+                    // 在发送任何 MQ 之前，去 ChatMessage 表里查验是否已有对账程序立下的“空对话墓碑”
+                    ChatMessage tombstone = getOne(
+                            new LambdaQueryWrapper<ChatMessage>()
+                                    .eq(ChatMessage::getCorrelationId, txId)
+                    );
+
+                    if (tombstone != null && tombstone.getStatus() == 1) {
+                        log.warn("落库拦截：发现该对话已被立下墓碑（对账废弃）。丢弃 AI 生成结果，终止 Confirm 流程。txId: {}", txId);
+                        // 直接 return，不发落库 MQ，不发 Confirm MQ。彻底阻断脏数据。
+                        return;
+                    }
+
+                    String cleanContent = fullAiResponse
+                            .replaceAll("(?m)^(思考|行动|观察|Action)：.*$", "")
+                            .replaceAll("\\n+", "\n")
+                            .trim();
+
+                    // MQ 落库
+                    ChatMessageDTO aiMsgDTO = new ChatMessageDTO();
+                    aiMsgDTO.setId(aiMsgId);
+                    aiMsgDTO.setUserId(userId);
+                    aiMsgDTO.setSessionId(sessionId);
+                    aiMsgDTO.setRole(1);
+                    aiMsgDTO.setContent(cleanContent);
+                    aiMsgDTO.setCorrelationId(txId);
+                    aiMsgDTO.setStatus(0);
+                    rabbitTemplate.convertAndSend(RabbitMQConfig.CHAT_EXCHANGE, RabbitMQConfig.CHAT_ROUTING_KEY, aiMsgDTO);
+
+                    // TCC Confirm
+                    QuotaOperationDTO confirmDto = new QuotaOperationDTO();
+                    confirmDto.setTxId(txId);
+                    confirmDto.setChatId(aiMsgId);
+                    confirmDto.setUserId(userId);
+                    confirmDto.setAmount(costAmount);
+                    rabbitTemplate.convertAndSend("quota.direct", "confirm", confirmDto);
+                }
+        );
+        return sharedFlux;
     }
 
     @Override
-    public Flux<String> streamChatProcess(String message,Long agentId) {
-        Long userId = UserHolder.getUser().getId();
+    public Flux<String> streamChatProcess(String message, Long agentId, ChatAgentDTO agent, UserDTO userDTO) {
+        Long userId = userDTO.getId();
         Long txId = snowflakeIdWorker.nextId();       // 流水事务 ID
         Long userMsgId = snowflakeIdWorker.nextId();  // 用户提问的专属消息 ID
         Long aiMsgId = snowflakeIdWorker.nextId();    // AI 回复的专属消息 ID
         Long sessionId = SessionHolder.getSessionId();
+
         if (sessionId == null) {
             // 拦截器放行了 -1，此处执行真实落库创建
             sessionId = userSessionService.createSession(userId, agentId, message);
             // 回填至上下文，方便本线程后续其他方法可能用到
             SessionHolder.saveSessionId(sessionId);
         }
+        sessionBloomFilter.add(userId + ":" + sessionId);
         Integer costAmount = 1; // 本次对话消耗额度
         // 2. 阶段一：Try (预占额度)
         // 必须在调用大模型前进行同步阻塞检查
-        ChatAgentDTO agent = chatAgentService.getAgentById(agentId);
         if(agent==null){
             throw new RuntimeException("智能体不存在");
         }

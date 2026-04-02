@@ -1,0 +1,303 @@
+package com.aiconsultant.consultant.service.impl;
+
+import cn.hutool.core.bean.BeanUtil;
+import cn.hutool.core.util.StrUtil;
+import cn.hutool.json.JSONUtil;
+import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.aiconsultant.consultant.entity.ChatAgent;
+import com.aiconsultant.consultant.mapper.ChatAgentMapper;
+import com.aiconsultant.consultant.pojo.ChatAgentDTO;
+import com.aiconsultant.consultant.pojo.ChatAgentDescription;
+import com.aiconsultant.consultant.pojo.Result;
+import com.aiconsultant.consultant.service.ChatAgentService;
+import lombok.extern.slf4j.Slf4j;
+import org.redisson.api.RLock;
+import org.redisson.api.RTopic;
+import org.redisson.api.RedissonClient;
+import org.redisson.client.RedisException;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.stereotype.Service;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
+
+import java.time.Duration;
+import java.util.List;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
+
+import static com.aiconsultant.consultant.utils.Constants.*;
+
+@Slf4j
+@Service
+public class ChatAgentServiceImpl extends ServiceImpl<ChatAgentMapper, ChatAgent> implements ChatAgentService {
+    @Autowired
+    private RedissonClient redissonClient;
+    @Autowired
+    private StringRedisTemplate stringRedisTemplate;
+
+    private static final int MAX_CONSECUTIVE_FAILURES = 5;
+    private static final long CIRCUIT_OPEN_WINDOW_MS = 30000;
+    private static final AtomicInteger consecutiveFailures = new AtomicInteger(0);
+    private static volatile long circuitOpenTimestamp = 0;
+
+    private final ConcurrentHashMap<Long, Flight> inflightRequests = new ConcurrentHashMap<>();
+
+    private static class Flight {
+        final CompletableFuture<ChatAgentDTO> future = new CompletableFuture<>();
+        final AtomicBoolean leader1Active = new AtomicBoolean(false);
+        final AtomicBoolean leader2Active = new AtomicBoolean(false);
+        final AtomicInteger totalFailures = new AtomicInteger(0);
+    }
+
+    // 1. 【彻底非阻塞化】：移除 block()，返回纯粹的 Mono<Void> 信号
+    private Mono<Void> waitForNotification(Long id) {
+        String topicKey = AGENT_TOPIC_KEY + id;
+        RTopic topic = redissonClient.getTopic(topicKey);
+
+        return Mono.<Void>create(sink -> {
+                    int listenerId = topic.addListener(String.class, (channel, msg) -> {
+                        if ("WAKE_UP".equals(msg)) {
+                            sink.success();
+                        }
+                    });
+                    sink.onDispose(() -> topic.removeListener(listenerId));
+                })
+                .timeout(Duration.ofSeconds(2))
+                .onErrorResume(TimeoutException.class, e -> {
+                    log.warn("等待智能体数据加载超时, id: {}", id);
+                    return Mono.empty();
+                });
+    }
+
+    // 2. 【兜底查询响应化】：所有 DB 动作被封装，通过订阅 boundedElastic 弹性执行
+    private Mono<ChatAgentDTO> getFromDbWithLocalFlight(Long id) {
+        Flight flight = inflightRequests.computeIfAbsent(id, k -> new Flight());
+
+        if (flight.leader1Active.compareAndSet(false, true)) {
+            return Mono.fromCallable(() -> {
+                        log.info("【底层领头羊】抢座成功，开始执行耗时的 DB 查询 id: {}", id);
+                        ChatAgent agent = this.getById(id);
+                        if (agent == null) {
+                            throw new RuntimeException("智能体不存在");
+                        }
+                        ChatAgentDTO dto = new ChatAgentDTO();
+                        BeanUtil.copyProperties(agent, dto);
+                        return dto;
+                    })
+                    .subscribeOn(Schedulers.boundedElastic())
+                    .doOnSuccess(dto -> flight.future.complete(dto))
+                    .doOnError(flight.future::completeExceptionally)
+                    .doFinally(st -> inflightRequests.remove(id));
+        }
+
+        log.info("【底层跟随者】发现领头羊正在查询，进入响应式等待队列 id: {}", id);
+        return Mono.fromFuture(flight.future)
+                .publishOn(Schedulers.parallel())
+                .onErrorMap(e -> new RuntimeException("等待缓存结果异常", e));
+    }
+
+    private void checkCircuitBreakerAndSentinel() {
+        if (consecutiveFailures.get() >= MAX_CONSECUTIVE_FAILURES) {
+            long now = System.currentTimeMillis();
+            if (now - circuitOpenTimestamp < CIRCUIT_OPEN_WINDOW_MS) {
+                if (ThreadLocalRandom.current().nextInt(100) < 5) {
+                    log.info("【哨兵探测】当前处于熔断状态，少量请求被放行以探测底层恢复情况...");
+                    return;
+                }
+                log.warn("【熔断拦截】系统连续失败次数过多，触发降级");
+                throw new RuntimeException("系统服务降级中，请稍后再试");
+            }
+        }
+    }
+
+    private void recordGlobalSuccess() {
+        if (consecutiveFailures.get() > 0) {
+            consecutiveFailures.set(0);
+            circuitOpenTimestamp = 0;
+            log.info("【熔断器恢复】探测到成功响应，服务状态已重置为健康");
+        }
+    }
+
+    private void recordGlobalFailure() {
+        int currentFails = consecutiveFailures.incrementAndGet();
+        if (currentFails == MAX_CONSECUTIVE_FAILURES) {
+            circuitOpenTimestamp = System.currentTimeMillis();
+            log.warn("【熔断器开启】累计失败达到阈值 {}，开启快速失败保护！", MAX_CONSECUTIVE_FAILURES);
+        }
+    }
+
+    // 3. 【领头羊响应式化】：返回 Mono，利用算子实现任务成功或失败的善后处理
+    private Mono<ChatAgentDTO> executeAsLeader(Long id, Flight flight, int leaderId) {
+        log.info("【领头羊 {}】开始执行核心查询逻辑 id: {}", leaderId, id);
+
+        // 传入初始重试次数 0
+        return executeComplexGetAgentLogic(id, 0)
+                .doOnSuccess(result -> {
+                    // Reactor 规范：如果返回空数据（Mono.empty），result 会是 null
+                    if (flight.future.complete(result)) {
+                        log.info("【领头羊 {}】凯旋归来，触发事件池唤醒等待者 id: {}", leaderId, id);
+                        inflightRequests.remove(id);
+                        recordGlobalSuccess();
+                    }
+                })
+                .doOnError(e -> {
+                    log.warn("【领头羊 {}】执行失败 id: {}", leaderId, id);
+                    int fails = flight.totalFailures.incrementAndGet();
+                    if (fails == 2 || (leaderId == 1 && !flight.leader2Active.get())) {
+                        if (flight.future.completeExceptionally(e)) {
+                            log.error("【全盘失败】请求资源失败，释放所有跟随者 id: {}", id);
+                            inflightRequests.remove(id);
+                            recordGlobalFailure();
+                        }
+                    }
+                })
+                .onErrorMap(e -> new RuntimeException("核心查询逻辑执行失败", e));
+    }
+
+    @Override
+    public Mono<ChatAgentDTO> getAgentById(Long id) {
+        checkCircuitBreakerAndSentinel();
+        Flight flight = inflightRequests.computeIfAbsent(id, k -> new Flight());
+
+        if (flight.leader1Active.compareAndSet(false, true)) {
+            return executeAsLeader(id, flight, 1);
+        }
+
+        return Mono.fromFuture(flight.future)
+                .publishOn(Schedulers.parallel())
+                .timeout(Duration.ofSeconds(2))
+                .onErrorResume(TimeoutException.class, e -> {
+                    if (flight.leader2Active.compareAndSet(false, true)) {
+                        log.info("【对冲模式】主领头羊 2 秒未归，唤醒备用线程升级为【第二领头羊】 id: {}", id);
+                        // 触发第二领头羊逻辑，无需 block()
+                        executeAsLeader(id, flight, 2).subscribe();
+                    } else {
+                        log.info("【跟随者】已有两位领头羊在执行，继续等待最终结果...");
+                    }
+                    return Mono.fromFuture(flight.future)
+                            .publishOn(Schedulers.parallel())
+                            .timeout(Duration.ofSeconds(13));
+                })
+                .onErrorMap(e -> new RuntimeException("系统繁忙，请稍后再试", e));
+    }
+
+    // 4. 【消灭 while 循环】：将命令式重试逻辑改造为响应式的结构
+    public Mono<ChatAgentDTO> executeComplexGetAgentLogic(Long id, int retryCount) {
+        if (retryCount >= 3) {
+            return Mono.error(new RuntimeException("当前咨询人数过多，请稍后再试"));
+        }
+
+        String cacheKey = AGENT_CACHE_KEY + id;
+
+        // 步骤 A：缓存查询（将其隔离到工作线程）
+        return Mono.fromCallable(() -> {
+                    String json = stringRedisTemplate.opsForValue().get(cacheKey);
+                    // 用特定字符串标识没命中，避免与真实的 "null" 字符串混淆
+                    return json == null ? "CACHE_MISS" : json;
+                })
+                .subscribeOn(Schedulers.boundedElastic())
+                .flatMap(result -> {
+                    if ("CACHE_MISS".equals(result)) {
+                        // 步骤 B：缓存未命中，调用锁与 DB 的提取逻辑
+                        return tryLockAndFetchDb(id, cacheKey, retryCount);
+                    } else if ("null".equals(result)) {
+                        // 如果缓存里就是空，返回 Mono.empty()
+                        return Mono.empty();
+                    } else {
+                        return Mono.just(JSONUtil.toBean(result, ChatAgentDTO.class));
+                    }
+                })
+                .onErrorResume(RedisException.class, e -> getFromDbWithLocalFlight(id));
+    }
+
+    // 5. 【拆分阻塞操作】：将锁的竞争与 DB 调用拆解
+    private Mono<ChatAgentDTO> tryLockAndFetchDb(Long id, String cacheKey, int retryCount) {
+        String lockKey = AGENT_LOCK_KEY + id;
+        RLock lock = redissonClient.getLock(lockKey);
+
+        return Mono.fromCallable(() -> lock.tryLock(0, 10, TimeUnit.SECONDS))
+                .subscribeOn(Schedulers.boundedElastic())
+                .flatMap(locked -> {
+                    if (locked) {
+                        return Mono.fromCallable(() -> {
+                                    try {
+                                        String doubleCheck = stringRedisTemplate.opsForValue().get(cacheKey);
+                                        if (StrUtil.isNotBlank(doubleCheck)) {
+                                            return "null".equals(doubleCheck) ? null : JSONUtil.toBean(doubleCheck, ChatAgentDTO.class);
+                                        }
+
+                                        ChatAgent agent = this.getById(id);
+                                        if (agent == null) {
+                                            stringRedisTemplate.opsForValue().set(cacheKey, "null", 5, TimeUnit.MINUTES);
+                                            return null;
+                                        }
+
+                                        ChatAgentDTO dto = new ChatAgentDTO();
+                                        BeanUtil.copyProperties(agent, dto);
+                                        stringRedisTemplate.opsForValue().set(cacheKey, JSONUtil.toJsonStr(dto), 1, TimeUnit.DAYS);
+
+                                        redissonClient.getTopic(AGENT_TOPIC_KEY + id).publish("WAKE_UP");
+                                        return dto;
+                                    } finally {
+                                        lock.unlock();
+                                    }
+                                })
+                                .subscribeOn(Schedulers.boundedElastic())
+                                // 处理可能返回的 null，转化为合法的 Mono.empty()
+                                .flatMap(dto -> dto == null ? Mono.empty() : Mono.just(dto));
+                    } else {
+                        long jitter = ThreadLocalRandom.current().nextLong(50, 200);
+                        // 步骤 C：没抢到锁，等待事件通知后，通过 Mono.defer 递归实现非阻塞循环
+                        return waitForNotification(id)
+                                .delayElement(Duration.ofMillis(jitter))
+                                .then(Mono.defer(() -> executeComplexGetAgentLogic(id, retryCount + 1)));
+                    }
+                });
+    }
+
+    private static class AgentListFlight {
+        final CompletableFuture<List<ChatAgentDescription>> future = new CompletableFuture<>();
+        final AtomicBoolean leader1Active = new AtomicBoolean(false);
+        final AtomicBoolean leader2Active = new AtomicBoolean(false);
+        final AtomicInteger totalFailures = new AtomicInteger(0);
+    }
+
+    private final ConcurrentHashMap<String, AgentListFlight> listInflightRequests = new ConcurrentHashMap<>();
+
+    @Override
+    public Mono<Result> getAgentDescriptionList() {
+        String flightKey = "FLIGHT:AGENT_LIST:ALL";
+        AgentListFlight flight = listInflightRequests.computeIfAbsent(flightKey, k -> new AgentListFlight());
+
+        if (flight.leader1Active.compareAndSet(false, true)) {
+            return Mono.fromCallable(() -> {
+                        log.info("【领头羊】发起全量智能体列表 DB 查询...");
+                        List<ChatAgent> agents = this.list();
+                        List<ChatAgentDescription> dtoList = agents.stream().map(agent -> {
+                            ChatAgentDescription dto = new ChatAgentDescription();
+                            dto.setId(agent.getId());
+                            dto.setName(agent.getName());
+                            dto.setDescription(agent.getDescription());
+                            return dto;
+                        }).collect(Collectors.toList());
+
+                        flight.future.complete(dtoList);
+                        return Result.ok(dtoList);
+                    })
+                    .subscribeOn(Schedulers.boundedElastic())
+                    .doOnError(flight.future::completeExceptionally)
+                    .doFinally(st -> listInflightRequests.remove(flightKey));
+        }
+
+        log.info("【跟随者】发现已有线程在查询智能体列表，进入事件池共享等待...");
+
+        return Mono.fromFuture(flight.future)
+                .publishOn(Schedulers.parallel())
+                .timeout(Duration.ofSeconds(15))
+                .onErrorMap(e -> new RuntimeException("系统繁忙，请稍后再试", e))
+                .map(Result::ok);
+    }
+}

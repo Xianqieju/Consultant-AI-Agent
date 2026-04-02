@@ -172,16 +172,13 @@
                         credentials: 'include'
                     });
 
-                    if (response.ok) {
-                        const result = await response.json();
-                        if (result.success) {
-                            alert("注册成功！即将前往登录。");
-                            window.location.href = '/login.html';
-                        } else {
-                            alert("注册失败: " + (result.errorMsg || "该账号或手机号可能已被占用"));
-                        }
+                    const result = await response.json().catch(() => ({}));
+                    // 后端统一 Result：成功时多为 Result.ok()，无 data
+                    if (response.ok && result.success === true) {
+                        alert("注册成功！即将前往登录。");
+                        window.location.href = '/login.html';
                     } else {
-                        alert("服务器异常，响应码：" + response.status);
+                        alert("注册失败: " + (result.errorMsg || "该账号或手机号可能已被占用"));
                     }
                 } catch (error) {
                     console.error("注册请求出错:", error);

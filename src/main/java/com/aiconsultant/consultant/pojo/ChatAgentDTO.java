@@ -7,4 +7,5 @@ public class ChatAgentDTO {
     private Long id;
     private String name;
     private String systemPrompt;
+
 }

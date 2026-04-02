@@ -13,8 +13,7 @@ import org.springframework.web.servlet.HandlerInterceptor;
 @Component
 public class SessionInterceptor implements HandlerInterceptor {
 
-    @Resource
-    private UserSessionService userSessionService;
+
 
     @Override
     public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) throws Exception {
@@ -31,20 +30,9 @@ public class SessionInterceptor implements HandlerInterceptor {
         }
 
         Long sessionId = Long.valueOf(sessionIdStr);
-        Long userId = UserHolder.getUser().getId();
 
-        // 2. 校验归属权
-        boolean isValid = userSessionService.query()
-                .eq("id",sessionId)
-                .eq("user_id",userId)
-                .exists();
-
-        if (isValid) {
-            // 【核心改动】：校验通过后，存入上下文
-            SessionHolder.saveSessionId(sessionId);
-            return true;
-        }
-        return false;
+        SessionHolder.saveSessionId(sessionId);
+        return true;
     }
 
     @Override

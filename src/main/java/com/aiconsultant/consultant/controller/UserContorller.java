@@ -32,4 +32,13 @@ public class UserContorller {
     public Result register(@RequestBody User user) {
         return userService.register(user);
     }
+
+    @PostMapping("/refresh")
+    public Result refresh(
+            // required = false 防止没带 Cookie 时直接报 400，让我们能在 Service 层优雅处理
+            @CookieValue(value = "refreshToken", required = false) String refreshToken) {
+
+        // 拆包完成，把干净的 String 传给下层
+        return userService.refreshToken(refreshToken);
+    }
 }
