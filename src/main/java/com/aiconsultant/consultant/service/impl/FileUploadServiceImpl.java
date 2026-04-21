@@ -7,6 +7,8 @@ import com.aiconsultant.consultant.entity.FileMetadata;
 import com.aiconsultant.consultant.mapper.FileMetadataMapper;
 import com.aiconsultant.consultant.pojo.Result;
 import com.aiconsultant.consultant.service.FileUploadService;
+import com.aiconsultant.consultant.service.RagDocumentService;
+import com.aiconsultant.consultant.service.RagIngestionService;
 import com.aiconsultant.consultant.utils.UserHolder;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.io.FileUtils;
@@ -21,38 +23,47 @@ import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.time.LocalDateTime;
 import java.util.*;
+import java.util.Objects;
 
 @Service
 @Slf4j
 public class FileUploadServiceImpl extends ServiceImpl<FileMetadataMapper, FileMetadata> implements FileUploadService {
     @Autowired
     private StringRedisTemplate stringRedisTemplate;
+    @Autowired
+    private RagDocumentService ragDocumentService;
+    @Autowired
+    private RagIngestionService ragIngestionService;
 
+    @Override
     public Result checkUpload(String md5, String fileName, Integer totalChunks) {
         // 1. 检查数据库，看是否有其他用户（或自己以前）完整上传过该文件
         FileMetadata existingFile = this.getOne(
                 new LambdaQueryWrapper<FileMetadata>().eq(FileMetadata::getFileMd5, md5)
         );
 
-        if (existingFile != null) {
-            // 【秒传场景】数据库已有记录，直接为当前用户关联一份元数据
-            Long currentUserId = UserHolder.getUser().getId();
+        boolean ragReady = ragDocumentService.findByContentHash(md5)
+                .map(d -> Objects.equals(1, d.getParseStatus()))
+                .orElse(false);
 
-            // 如果当前用户还没关联过这个文件，则新增一条记录（指向同一个物理路径）
-            // 这里可以根据业务需求决定是直接返回成功，还是在数据库新插一条 user_id 不同的记录
-            log.info("触发秒传逻辑，文件 MD5: {}, 用户 ID: {}", md5, currentUserId);
-            return Result.ok("秒传成功");
+        if (existingFile != null) {
+            Long currentUserId = UserHolder.getUser().getId();
+            log.info("触发秒传逻辑，文件 MD5: {}, 用户 ID: {}, ragReady={}", md5, currentUserId, ragReady);
+            Map<String, Object> instant = new HashMap<>();
+            instant.put("instantUpload", true);
+            instant.put("message", "秒传成功");
+            instant.put("ragReady", ragReady);
+            return Result.ok(instant);
         }
 
         // 2. 【断点续传场景】如果数据库没有，去 Redis 检查是否有已上传的分片
         String redisKey = "upload:progress:" + md5;
         Set<String> uploadedChunks = stringRedisTemplate.opsForSet().members(redisKey);
 
-        // 3. 返回给前端已经存在的分片索引列表
-        // 前端收到后，会对比自己手中的分片，只发送那些不在列表中的分片
         Map<String, Object> resultMap = new HashMap<>();
-        resultMap.put("uploadedChunks", uploadedChunks); // 比如 ["1", "2", "5"]
-        resultMap.put("isUploaded", false);
+        resultMap.put("uploadedChunks", uploadedChunks == null ? Collections.emptySet() : uploadedChunks);
+        resultMap.put("instantUpload", false);
+        resultMap.put("ragReady", ragReady);
 
         return Result.ok(resultMap);
     }
@@ -118,7 +129,20 @@ public class FileUploadServiceImpl extends ServiceImpl<FileMetadataMapper, FileM
 
         this.save(metadata);
 
-        // 5. 清理碎片与 Redis
+        // 5. 合并成功后：按 MD5 幂等触发 RAG（摘要提纲 + 分块入库），已存在且成功则跳过
+        try {
+            ragIngestionService.scheduleIngestIfNeeded(
+                    md5,
+                    currentUserId,
+                    finalFile.getAbsolutePath(),
+                    fileName,
+                    FileUtil.extName(fileName)
+            );
+        } catch (Exception ex) {
+            log.error("RAG 调度失败（文件已保存），md5={}", md5, ex);
+        }
+
+        // 6. 清理碎片与 Redis
         FileUtils.deleteDirectory(tempDir);
         stringRedisTemplate.delete("upload:progress:" + md5);
 

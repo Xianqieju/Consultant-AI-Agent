@@ -3,10 +3,14 @@ package com.aiconsultant.consultant.aiservice;
 import dev.langchain4j.service.SystemMessage;
 import dev.langchain4j.service.UserMessage;
 import dev.langchain4j.service.spring.AiService;
+import dev.langchain4j.service.spring.AiServiceWiringMode;
 
 import java.util.List;
 
-@AiService(chatModel = "openAiChatModel")
+@AiService(
+        wiringMode = AiServiceWiringMode.EXPLICIT,
+        chatModel = "openAiChatModel"
+)
 public interface ToolRouterService {
 
     @SystemMessage("""

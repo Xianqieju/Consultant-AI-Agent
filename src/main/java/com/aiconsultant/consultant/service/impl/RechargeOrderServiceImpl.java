@@ -24,6 +24,7 @@ import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.math.BigDecimal;
+import java.time.LocalDateTime;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -100,6 +101,42 @@ public class RechargeOrderServiceImpl extends ServiceImpl<RechargeOrderMapper, R
 
     @Override
     @Transactional(rollbackFor = Exception.class)
+    public Result closeOrder(String orderNo) {
+        UserDTO user = UserHolder.getUser();
+        if (user == null || user.getId() == null) {
+            return Result.fail("未获取到登录状态");
+        }
+        RechargeOrder order = this.lambdaQuery()
+                .eq(RechargeOrder::getOrderNo, orderNo)
+                .eq(RechargeOrder::getUserId, user.getId())
+                .one();
+        if (order == null) {
+            return Result.fail("订单不存在");
+        }
+        if (order.getStatus() == null || order.getStatus() != 0) {
+            return Result.fail("仅待支付订单可关单");
+        }
+        order.setStatus(3);
+        if (!this.updateById(order)) {
+            return Result.fail("订单状态已变更，请刷新后重试");
+        }
+        if (!BankSimulator.simulateCloseOrder(orderNo)) {
+            log.warn("[关单] 银行侧关单未成功（可能已支付），orderNo={}", orderNo);
+        }
+        return Result.ok();
+    }
+
+    @Override
+    public Result simulateBankRefund(String orderNo) {
+        if (orderNo == null || orderNo.isEmpty()) {
+            return Result.fail("orderNo 不能为空");
+        }
+        boolean ok = BankSimulator.simulateRefund(orderNo);
+        return ok ? Result.ok() : Result.fail("退款失败：流水非已支付或已处理");
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
     public String handleBankCallback(BankCallbackDTO callbackDto) {
         String orderNo = callbackDto.getOrderNo();
 
@@ -116,6 +153,15 @@ public class RechargeOrderServiceImpl extends ServiceImpl<RechargeOrderMapper, R
             return "SUCCESS";
         }
 
+        // 本地已关单：银行迟到的成功回调 → 仅触发银行侧退款模拟，不入账、不发件箱
+        if (order.getStatus() != null && order.getStatus() == 3) {
+            if (callbackDto.getStatus() != null && callbackDto.getStatus() == 1) {
+                boolean refunded = BankSimulator.simulateRefund(orderNo);
+                log.info("关单后收到成功回调，已触发模拟退款 orderNo={}, refunded={}", orderNo, refunded);
+            }
+            return "SUCCESS";
+        }
+
         if (callbackDto.getStatus() != null && callbackDto.getStatus() != 1) {
             order.setStatus(2);
             this.updateById(order);
@@ -123,7 +169,10 @@ public class RechargeOrderServiceImpl extends ServiceImpl<RechargeOrderMapper, R
         }
 
         order.setStatus(1);
-        this.updateById(order);
+        if (!this.updateById(order)) {
+            log.warn("回调更新订单乐观锁冲突 orderNo={}", orderNo);
+            return "FAIL";
+        }
         BankSimulator.recordCallbackSuccess(orderNo);
 
         try {
@@ -164,5 +213,46 @@ public class RechargeOrderServiceImpl extends ServiceImpl<RechargeOrderMapper, R
         }
 
         return "SUCCESS";
+    }
+
+    @Override
+    public boolean reconcileTimeoutOrder(String orderNo) {
+        if (orderNo == null || orderNo.isEmpty()) {
+            log.warn("reconcileTimeoutOrder: orderNo 为空");
+            return true;
+        }
+        RechargeOrder order = this.lambdaQuery()
+                .eq(RechargeOrder::getOrderNo, orderNo)
+                .one();
+        if (order == null) {
+            log.warn("取消下游订单不存在 orderNo={}", orderNo);
+            return true;
+        }
+        if (order.getStatus() != null && order.getStatus() != 0) {
+            log.info("取消下游跳过：订单已终态 orderNo={}, status={}", orderNo, order.getStatus());
+            return true;
+        }
+
+        int bankStatus = BankSimulator.queryPaymentStatusByOrderNo(orderNo);
+        if (bankStatus == 1) {
+            log.warn("取消下游补偿：银行已支付本地仍待支付，触发与回调一致的处理 orderNo={}", orderNo);
+            BankCallbackDTO dto = new BankCallbackDTO();
+            dto.setOrderNo(orderNo);
+            dto.setStatus(1);
+            dto.setPayToken("");
+            String result = handleBankCallback(dto);
+            return "SUCCESS".equals(result);
+        }
+
+        order.setStatus(3);
+        if (!this.updateById(order)) {
+            log.warn("取消下游关单乐观锁冲突，可能已被他处更新 orderNo={}", orderNo);
+            return true;
+        }
+        if (!BankSimulator.simulateCloseOrder(orderNo)) {
+            log.warn("取消下游银行关单未成功 orderNo={}", orderNo);
+        }
+        log.info("取消下游超时关单完成 orderNo={}", orderNo);
+        return true;
     }
 }

@@ -7,24 +7,23 @@ import java.math.BigDecimal;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
+/**
+ * 银行侧模拟：账本状态见 {@link BankTransaction#getStatus()}
+ * 0 待支付 1 已支付 2 失败 3 关单(未支付关闭) 4 已退款
+ */
 @Slf4j
 public class BankSimulator {
 
-    /** Key: payToken */
     private static final ConcurrentHashMap<String, BankTransaction> bankLedger = new ConcurrentHashMap<>();
-    /** Key: merchantOrderNo -> payToken */
     private static final ConcurrentHashMap<String, String> orderNoToPayToken = new ConcurrentHashMap<>();
 
-    /**
-     * 模拟向银行申请支付，换取鉴权码 (payToken)
-     */
     public static String applyPayment(String merchantOrderNo, BigDecimal amount, String channel) {
         String payToken = "BANK_" + channel + "_" + UUID.randomUUID().toString().replace("-", "");
 
         BankTransaction transaction = new BankTransaction();
         transaction.setMerchantOrderNo(merchantOrderNo);
         transaction.setAmount(amount);
-        transaction.setStatus(0); // 0: 待支付
+        transaction.setStatus(0);
 
         bankLedger.put(payToken, transaction);
         orderNoToPayToken.put(merchantOrderNo, payToken);
@@ -33,32 +32,27 @@ public class BankSimulator {
         return payToken;
     }
 
-    /**
-     * 商户回调成功时同步银行侧账本为已支付（真实场景中银行已扣款成功）。
-     */
-    public static void recordCallbackSuccess(String merchantOrderNo) {
+    private static BankTransaction requireTx(String merchantOrderNo) {
         String payToken = orderNoToPayToken.get(merchantOrderNo);
         if (payToken == null) {
-            log.warn("[银行模拟器] 回调成功但无订单映射 orderNo={}", merchantOrderNo);
-            return;
+            return null;
         }
-        BankTransaction tx = bankLedger.get(payToken);
-        if (tx != null) {
+        return bankLedger.get(payToken);
+    }
+
+    /**
+     * 商户回调成功时同步银行侧为已支付。
+     */
+    public static void recordCallbackSuccess(String merchantOrderNo) {
+        BankTransaction tx = requireTx(merchantOrderNo);
+        if (tx != null && Integer.valueOf(0).equals(tx.getStatus())) {
             tx.setStatus(1);
             log.info("[银行模拟器] 回调确认支付成功 orderNo={}", merchantOrderNo);
         }
     }
 
-    /**
-     * 模拟「用户已在银行侧完成支付、银行账本已入账」但商户回调尚未到达（用于联调取消补偿）。
-     */
     public static void simulateCustomerPaidAtBank(String merchantOrderNo) {
-        String payToken = orderNoToPayToken.get(merchantOrderNo);
-        if (payToken == null) {
-            log.warn("[银行模拟器] simulateCustomerPaidAtBank 无订单 {}", merchantOrderNo);
-            return;
-        }
-        BankTransaction tx = bankLedger.get(payToken);
+        BankTransaction tx = requireTx(merchantOrderNo);
         if (tx != null) {
             tx.setStatus(1);
             log.info("[银行模拟器] 模拟用户已在银行支付成功 orderNo={}", merchantOrderNo);
@@ -66,14 +60,54 @@ public class BankSimulator {
     }
 
     /**
-     * 取消任务调用的银行查询：返回银行侧支付状态。0 待支付，1 成功，2 失败；-1 无此单。
+     * 关单：仅未支付单可关；已支付需先 {@link #simulateRefund(String)}。
+     *
+     * @return 是否关单成功
+     */
+    public static boolean simulateCloseOrder(String merchantOrderNo) {
+        BankTransaction tx = requireTx(merchantOrderNo);
+        if (tx == null) {
+            log.warn("[银行模拟器] 关单失败，无此单 orderNo={}", merchantOrderNo);
+            return false;
+        }
+        if (tx.getStatus() != null && tx.getStatus() == 1) {
+            log.warn("[银行模拟器] 关单拒绝：已支付 orderNo={}", merchantOrderNo);
+            return false;
+        }
+        if (tx.getStatus() != null && (tx.getStatus() == 3 || tx.getStatus() == 4)) {
+            log.info("[银行模拟器] 关单幂等：已关单或已退款 orderNo={}", merchantOrderNo);
+            return true;
+        }
+        tx.setStatus(3);
+        log.info("[银行模拟器] 关单成功 orderNo={}", merchantOrderNo);
+        return true;
+    }
+
+    /**
+     * 模拟退款：仅对已支付流水退款一次。
+     *
+     * @return 是否退款成功
+     */
+    public static boolean simulateRefund(String merchantOrderNo) {
+        BankTransaction tx = requireTx(merchantOrderNo);
+        if (tx == null) {
+            log.warn("[银行模拟器] 退款失败，无此单 orderNo={}", merchantOrderNo);
+            return false;
+        }
+        if (tx.getStatus() == null || tx.getStatus() != 1) {
+            log.warn("[银行模拟器] 退款拒绝：当前非已支付状态 orderNo={}, status={}", merchantOrderNo, tx.getStatus());
+            return false;
+        }
+        tx.setStatus(4);
+        log.info("[银行模拟器] 退款成功 orderNo={}, amount={}", merchantOrderNo, tx.getAmount());
+        return true;
+    }
+
+    /**
+     * 查询银行侧状态：-1 无单；否则 0/1/2/3/4
      */
     public static int queryPaymentStatusByOrderNo(String merchantOrderNo) {
-        String payToken = orderNoToPayToken.get(merchantOrderNo);
-        if (payToken == null) {
-            return -1;
-        }
-        BankTransaction tx = bankLedger.get(payToken);
+        BankTransaction tx = requireTx(merchantOrderNo);
         if (tx == null) {
             return -1;
         }
@@ -84,7 +118,7 @@ public class BankSimulator {
     public static class BankTransaction {
         private String merchantOrderNo;
         private BigDecimal amount;
-        /** 0:待支付, 1:成功, 2:失败 */
+        /** 0 待支付 1 已支付 2 失败 3 关单 4 已退款 */
         private Integer status;
     }
 }

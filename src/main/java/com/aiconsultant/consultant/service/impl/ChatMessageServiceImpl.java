@@ -5,16 +5,20 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.aiconsultant.consultant.aiservice.*;
 import com.aiconsultant.consultant.config.RabbitMQConfig;
+import com.aiconsultant.consultant.enums.UserIntent;
 import com.aiconsultant.consultant.entity.ChatMessage;
 import com.aiconsultant.consultant.mapper.ChatMessageMapper;
 import com.aiconsultant.consultant.registry.DynamicToolRegistry;
 import com.aiconsultant.consultant.service.ChatAgentService;
 import com.aiconsultant.consultant.service.ChatMessageService;
+import com.aiconsultant.consultant.service.NoteGradingOrchestrationService;
+import com.aiconsultant.consultant.service.MemorySummaryTriggerService;
 import com.aiconsultant.consultant.service.QuotaService;
 import com.aiconsultant.consultant.service.UserSessionService;
 import com.aiconsultant.consultant.utils.SessionHolder;
 import com.aiconsultant.consultant.utils.SnowflakeIdWorker;
 import com.aiconsultant.consultant.utils.UserHolder;
+import com.aiconsultant.consultant.aiservice.notegrading.NoteTechnicalGuideAgent;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.memory.ChatMemory;
@@ -28,6 +32,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.BufferOverflowStrategy;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -57,6 +62,12 @@ public class ChatMessageServiceImpl extends ServiceImpl<ChatMessageMapper, ChatM
     private UserSessionService userSessionService;
     @Autowired
     private IntentRouterService intentRouterService;
+
+    @Autowired
+    private NoteTechnicalGuideAgent noteTechnicalGuideAgent;
+
+    @Autowired
+    private NoteGradingOrchestrationService noteGradingOrchestrationService;
     @Autowired
     private TaskAgent taskAgent;
     @Autowired
@@ -69,41 +80,58 @@ public class ChatMessageServiceImpl extends ServiceImpl<ChatMessageMapper, ChatM
     private OpenAiStreamingChatModel openAiStreamingChatModel;
     @Autowired
     private RBloomFilter<String> sessionBloomFilter;
+    @Autowired
+    private MemorySummaryTriggerService memorySummaryTriggerService;
 
     private Flux<String> routeAndExecuteChat(
             Long sessionId, String message, String dynamicPrompt,
             Long txId, Long aiMsgId, Long userId, Integer costAmount) {
 
-        // 1. 动态意图路由：询问大模型，本次对话需要挂载哪些工具？
-        List<String> rawTools = toolRouterService.determineRequiredTools(message);
-        List<String> requiredTools = rawTools == null ? new ArrayList<>() : rawTools.stream()
-                .filter(s -> s != null && !s.isBlank() && !s.equals("[]"))
-                .collect(Collectors.toList());
-        log.info("会话 [{}], 识别出需要调用的工具列表: {}", sessionId, requiredTools);
+        // 0. 意图路由：如果是“修改/批改笔记”，走多智能体批改流水线
+        UserIntent intent = intentRouterService.classifyIntent(message);
+        log.info("会话 [{}], 意图识别结果: {}", sessionId, intent);
 
         Flux<String> aiResponseFlux;
 
-        // 2. 动态分发与组装策略
-        if (requiredTools == null || requiredTools.isEmpty()) {
-            // 走轻量级通道：没有任何工具，直接调用静态的闲聊 Agent
-            log.info("--> 路由分流：触发【闲聊陪伴智能体】，纯文本流式响应...");
-            aiResponseFlux = casualChatAgent.chat(sessionId, message, dynamicPrompt);
+        if (intent == UserIntent.NOTE_EDIT_GRADE) {
+            // 技术指导：抽取待处理原文（失败则回退为原消息）
+            String extractedNote = noteTechnicalGuideAgent.extractNote(message);
+            if (extractedNote == null || extractedNote.isBlank() || extractedNote.contains("[NO_CONTENT_MATCH]")) {
+                extractedNote = message;
+            }
 
+            Mono<String> gradedMono = noteGradingOrchestrationService.gradeNoteReactive(sessionId, userId, extractedNote);
+            aiResponseFlux = gradedMono.flux();
         } else {
-            // 走重负载通道：根据工具名称，从 Map 中提取真实的 Java 实例
-            log.info("--> 路由分流：触发【动态任务智能体】，开始挂载工具链...");
-            Object[] toolInstances = dynamicToolRegistry.getToolsByNames(requiredTools);
+            // 1. 动态意图路由：询问大模型，本次对话需要挂载哪些工具？
+            List<String> rawTools = toolRouterService.determineRequiredTools(message);
+            List<String> requiredTools = rawTools == null ? new ArrayList<>() : rawTools.stream()
+                    .filter(s -> s != null && !s.isBlank() && !s.equals("[]"))
+                    .collect(Collectors.toList());
+            log.info("会话 [{}], 识别出需要调用的工具列表: {}", sessionId, requiredTools);
 
-            // 【核心架构突破】：编程式构建动态 Agent
-            // 每次请求到来时，现场组装一个只包含本次所需工具的专属 Agent
-            DynamicTaskAgent dynamicAgent = AiServices.builder(DynamicTaskAgent.class)
-                    .streamingChatModel(openAiStreamingChatModel) // 绑定流式输出模型
-                    .chatMemoryProvider(chatMemoryProvider)       // 绑定历史上下文记忆
-                    .tools(toolInstances)                         // 仅注入本次路由选中的工具
-                    .build();
+            // 2. 动态分发与组装策略
+            if (requiredTools == null || requiredTools.isEmpty()) {
+                // 走轻量级通道：没有任何工具，直接调用静态的闲聊 Agent
+                log.info("--> 路由分流：触发【闲聊陪伴智能体】，纯文本流式响应...");
+                aiResponseFlux = casualChatAgent.chat(sessionId, message, dynamicPrompt);
 
-            // 发起流式对话
-            aiResponseFlux = dynamicAgent.chat(sessionId, message, dynamicPrompt);
+            } else {
+                // 走重负载通道：根据工具名称，从 Map 中提取真实的 Java 实例
+                log.info("--> 路由分流：触发【动态任务智能体】，开始挂载工具链...");
+                Object[] toolInstances = dynamicToolRegistry.getToolsByNames(requiredTools);
+
+                // 【核心架构突破】：编程式构建动态 Agent
+                // 每次请求到来时，现场组装一个只包含本次所需工具的专属 Agent
+                DynamicTaskAgent dynamicAgent = AiServices.builder(DynamicTaskAgent.class)
+                        .streamingChatModel(openAiStreamingChatModel) // 绑定流式输出模型
+                        .chatMemoryProvider(chatMemoryProvider)       // 绑定历史上下文记忆
+                        .tools(toolInstances)                         // 仅注入本次路由选中的工具
+                        .build();
+
+                // 发起流式对话
+                aiResponseFlux = dynamicAgent.chat(sessionId, message, dynamicPrompt);
+            }
         }
         Flux<String> protectedFlux = aiResponseFlux
                 // 1. 【限流请求】告诉上游：“每次只给我发 10 个 Token，我处理完了你再发下一批”
@@ -174,6 +202,12 @@ public class ChatMessageServiceImpl extends ServiceImpl<ChatMessageMapper, ChatM
                     confirmDto.setUserId(userId);
                     confirmDto.setAmount(costAmount);
                     rabbitTemplate.convertAndSend("quota.direct", "confirm", confirmDto);
+
+                    try {
+                        memorySummaryTriggerService.tryEnqueueAfterAssistantReply(sessionId, userId);
+                    } catch (Exception ex) {
+                        log.warn("会话摘要发件箱入队跳过（不影响对话） sessionId={} userId={}", sessionId, userId, ex);
+                    }
                 }
         );
         return sharedFlux;

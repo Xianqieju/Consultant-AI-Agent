@@ -15,6 +15,11 @@ public class RabbitMQConfig {
     // 路由键
     public static final String CHAT_ROUTING_KEY = "chat.history.routing";
 
+    /** 会话摘要异步任务 */
+    public static final String MEMORY_EXCHANGE = "memory.exchange";
+    public static final String MEMORY_SUMMARY_QUEUE = "memory.summary.queue";
+    public static final String MEMORY_SUMMARY_ROUTING_KEY = "memory.summary.routing";
+
     /**
      * 1. 声明队列
      * name: 队列名称
@@ -45,6 +50,24 @@ public class RabbitMQConfig {
                 .bind(chatHistoryQueue)
                 .to(chatExchange)
                 .with(CHAT_ROUTING_KEY);
+    }
+
+    @Bean
+    public Queue memorySummaryQueue() {
+        return new Queue(MEMORY_SUMMARY_QUEUE, true);
+    }
+
+    @Bean
+    public TopicExchange memoryExchange() {
+        return new TopicExchange(MEMORY_EXCHANGE, true, false);
+    }
+
+    @Bean
+    public Binding bindingMemorySummary(Queue memorySummaryQueue, TopicExchange memoryExchange) {
+        return BindingBuilder
+                .bind(memorySummaryQueue)
+                .to(memoryExchange)
+                .with(MEMORY_SUMMARY_ROUTING_KEY);
     }
 
     /**

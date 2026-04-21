@@ -3,14 +3,10 @@ package com.aiconsultant.consultant.config;
 //import dev.langchain4j.community.store.embedding.redis.RedisEmbeddingStore;
 import dev.langchain4j.community.store.embedding.redis.RedisEmbeddingStore;
         import dev.langchain4j.data.segment.TextSegment;
-import dev.langchain4j.memory.ChatMemory;
-import dev.langchain4j.memory.chat.ChatMemoryProvider;
-import dev.langchain4j.memory.chat.MessageWindowChatMemory;
 import dev.langchain4j.model.embedding.EmbeddingModel;
         import dev.langchain4j.rag.content.retriever.ContentRetriever;
 import dev.langchain4j.rag.content.retriever.EmbeddingStoreContentRetriever;
         import dev.langchain4j.store.embedding.EmbeddingStore;
-        import dev.langchain4j.store.memory.chat.ChatMemoryStore;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -19,8 +15,6 @@ import org.springframework.context.annotation.Configuration;
 public class CommonConfig {
 //    @Autowired
 //    private OpenAiChatModel model;
-    @Autowired
-    private ChatMemoryStore redisChatMemoryStore;
     @Autowired
     private EmbeddingModel embeddingModel;
     @Autowired
@@ -42,35 +36,7 @@ public class CommonConfig {
 //        return memory;
 //    }
 
-    //构建ChatMemoryProvider对象
-    @Bean
-    public ChatMemoryProvider chatMemoryProvider(){
-        ChatMemoryProvider chatMemoryProvider = new ChatMemoryProvider() {
-            @Override
-            public ChatMemory get(Object memoryId) {
-                return MessageWindowChatMemory.builder()
-                        .id(memoryId)
-                        .maxMessages(20)
-                        .chatMemoryStore(redisChatMemoryStore)
-                        .build();
-            }
-        };
-        return chatMemoryProvider;
-    }
-
-//    @Bean
-//    public ChatMemoryProvider chatMemoryProvider(){
-//        ChatMemoryProvider chatMemoryProvider = new ChatMemoryProvider() {
-//            @Override
-//            public ChatMemory get(Object memoryId) {
-//                return MessageWindowChatMemory.builder()
-//                        .id(memoryId)
-//                        .maxMessages(20)
-//                        .build();
-//            }
-//        };
-//        return chatMemoryProvider;
-//    }
+    // ChatMemoryProvider 由 {@link com.aiconsultant.consultant.memory.SessionChatMemoryProvider} 提供（摘要注入 + 滑动窗口）
 
     //构建向量数据库操作对象
 //    @Bean

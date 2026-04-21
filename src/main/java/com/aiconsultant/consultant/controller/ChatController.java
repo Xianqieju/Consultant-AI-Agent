@@ -3,11 +3,18 @@ package com.aiconsultant.consultant.controller;
 import com.aiconsultant.consultant.annotation.RateLimit;
 import com.aiconsultant.consultant.manager.ReactivePermitManager;
 import com.aiconsultant.consultant.pojo.ChatAgentDTO;
+import com.aiconsultant.consultant.pojo.AnswerFeedbackDTO;
 import com.aiconsultant.consultant.pojo.ChatRequestDTO;
+import com.aiconsultant.consultant.pojo.MemoryProfileDTO;
 import com.aiconsultant.consultant.pojo.Result;
 import com.aiconsultant.consultant.pojo.UserDTO;
+import com.aiconsultant.consultant.service.AnswerFeedbackService;
 import com.aiconsultant.consultant.service.ChatAgentService;
 import com.aiconsultant.consultant.service.ChatMessageService;
+import com.aiconsultant.consultant.entity.UserSession;
+import com.aiconsultant.consultant.service.ChatSessionMemoryProfileService;
+import com.aiconsultant.consultant.service.UserSessionService;
+import com.aiconsultant.consultant.utils.SessionHolder;
 import com.aiconsultant.consultant.utils.UserHolder;
 import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
@@ -33,6 +40,12 @@ public class ChatController {
     private Executor aiExecutor;
     @Autowired
     private ReactivePermitManager reactivePermitManager;
+    @Autowired
+    private ChatSessionMemoryProfileService chatSessionMemoryProfileService;
+    @Autowired
+    private UserSessionService userSessionService;
+    @Autowired
+    private AnswerFeedbackService answerFeedbackService;
     /**
      * 流式对话接口
      * 改为 POST，避免长文本导致的 URL 长度超限
@@ -82,6 +95,78 @@ public class ChatController {
     @GetMapping("/memory")
     public Result getChat() {
         return chatMessageService.getHistoryAndRefreshMemory();
+    }
+
+    /**
+     * 当前登录用户 + 当前会话的画像 JSON（无记录时返回空壳骨架）。
+     */
+    @GetMapping("/memory-profile")
+    public Result getMemoryProfile() {
+        UserDTO user = UserHolder.getUser();
+        Long sessionId = SessionHolder.getSessionId();
+        if (sessionId == null) {
+            return Result.fail("缺少会话 sessionId，请先发起对话或传入会话上下文");
+        }
+        Result denied = assertSessionOwned(user.getId(), sessionId);
+        if (denied != null) {
+            return denied;
+        }
+        String json = chatSessionMemoryProfileService.getProfileJson(user.getId(), sessionId);
+        return Result.ok(new MemoryProfileDTO(json));
+    }
+
+    /**
+     * 全量覆盖会话画像；写入后事务提交会失效 Redis 缓存。
+     */
+    @PutMapping("/memory-profile")
+    public Result putMemoryProfile(@RequestBody MemoryProfileDTO body) {
+        if (body == null || body.getProfileJson() == null) {
+            return Result.fail("profileJson 不能为空");
+        }
+        UserDTO user = UserHolder.getUser();
+        Long sessionId = SessionHolder.getSessionId();
+        if (sessionId == null) {
+            return Result.fail("缺少会话 sessionId");
+        }
+        Result denied = assertSessionOwned(user.getId(), sessionId);
+        if (denied != null) {
+            return denied;
+        }
+        try {
+            chatSessionMemoryProfileService.saveProfile(user.getId(), sessionId, body.getProfileJson());
+            return Result.ok();
+        } catch (IllegalArgumentException e) {
+            return Result.fail(e.getMessage());
+        } catch (Exception e) {
+            log.error("保存会话画像失败", e);
+            return Result.fail("保存失败，请稍后重试");
+        }
+    }
+
+    /**
+     * 用户对 AI 回复做点赞/点踩（幂等覆盖）。
+     */
+    @PostMapping("/answer-feedback")
+    public Result answerFeedback(@RequestBody AnswerFeedbackDTO body) {
+        UserDTO user = UserHolder.getUser();
+        Long sessionId = SessionHolder.getSessionId();
+        if (sessionId == null) {
+            return Result.fail("缺少会话 sessionId");
+        }
+        Result denied = assertSessionOwned(user.getId(), sessionId);
+        if (denied != null) {
+            return denied;
+        }
+        return answerFeedbackService.submit(user.getId(), sessionId, body);
+    }
+
+    /** 无权限或会话不存在时返回 Result，否则返回 null */
+    private Result assertSessionOwned(Long userId, Long sessionId) {
+        UserSession us = userSessionService.getById(sessionId);
+        if (us == null || us.getUserId() == null || !us.getUserId().equals(userId)) {
+            return Result.fail("会话不存在或无权限");
+        }
+        return null;
     }
 
     /**

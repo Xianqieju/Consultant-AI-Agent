@@ -30,6 +30,122 @@ logging:
   level:
     dev.langchain4j: debug
 
+# RAG：启动时扫描未入库（或入库失败）的文件并补跑摘要提纲流水线
+app:
+  rag:
+    # 是否扫描 classpath 资源（如 content 目录下的 PDF）
+    startup-scan-enabled: true
+    startup-scan-patterns: classpath:content/*.pdf
+    # 扫描「已合并上传」但 RAG 未成功或未跑过的 file_metadata 记录
+    startup-repair-uploads-enabled: true
+    # 启动扫描入库时的归属用户（与知识库全局 -1 对齐时可改为 -1）
+    startup-system-user-id: -1
+    retrieval:
+      recall-max-results: 50
+      window-n: 1
+      coarse-top-k: 24
+      fine-top-k: 8
+      coarse-summary-weight: 0.55
+      chunk-head-chars: 1200
+    rerank:
+      enabled: false
+      endpoint: ${BGE_RERANK_ENDPOINT:}
+      api-key: ${BGE_RERANK_API_KEY:}
+      model: ${BGE_RERANK_MODEL:bge-reranker-v2-m3}
+      timeout-ms: 2500
+    # RAG 资产身份门禁（见 sql/rag_identity_permission_schema.sql）；false 时不查身份表
+    identity-access-enabled: false
+    # permissive：文档身份与用户∪Agent 身份有交集即通过；strict：文档身份须全部被用户∪Agent 覆盖
+    identity-policy: permissive
+    # 向量召回首轮扩大 maxResults 倍数（身份过滤前移后建议 >1）；上限见 identity-recall-max-cap
+    identity-prefilter-recall-multiplier: 2
+    identity-recall-max-cap: 200
+    # 首轮身份过滤后若无摘要命中，是否再发起一次更大 maxResults 的向量检索
+    identity-second-search-enabled: true
+    identity-second-search-max-cap: 400
+    # 精排后是否再跑一遍身份过滤；true 时跳过（召回环已过滤，省 DB）。存量向量无 rag_identity_ids 仍可检索
+    identity-skip-post-filter: true
+    # 摘要向量 metadata 中 rag_identity_ids 逗号串最大长度（入库时截断）
+    identity-metadata-max-len: 512
+    # 首轮向量召回合并（Redis 缓存 + Redisson 锁/Topic；与 langchain4j 嵌入模型名对齐）
+    coalesce:
+      vector:
+        enabled: false
+        embedding-model-id: text-embedding-v3
+        ttl-seconds: 120
+        lock-lease-seconds: 10
+        pub-sub-await-ms: 2000
+        max-load-attempts: 3
+        hedge-delay-ms: 1500
+        mono-timeout-seconds: 30
+        max-cached-matches: 100
+        max-cached-payload-bytes: 1500000
+        wake-jitter-min-ms: 50
+        wake-jitter-max-ms: 200
+
+  interview:
+    react:
+      max-rounds: 3
+      min-score: 7
+
+  # 笔记批改多智能体：跨步 Redis 记忆池（Hash，按 pipelineId）
+  note-grading:
+    # 为 true 时按 user_expert_permission 校验专家调用（未登录则非 GENERAL 专家不可用）
+    expert-permission-db-enabled: false
+    pool:
+      enabled: false
+      ttl-hours: 24
+      store-full-note: false
+      # 成功后缩短剩余 TTL（小时）；0 表示不缩短
+      after-success-ttl-hours: 1
+    retry:
+      enabled: true
+      # 首次失败后的最大重试次数（Reactor：2 => 含首次共最多 3 次调用）
+      max-attempts-after-failure: 2
+      initial-backoff-ms: 500
+      max-backoff-ms: 8000
+      jitter: 0.5
+    fallback:
+      enabled: true
+      context-max-chars: 6000
+    feedback:
+      enabled: true
+      max-user-comment-length: 2000
+      max-graded-excerpt-length: 4000
+    audit:
+      enabled: true
+      events-ttl-hours: 24
+      payload-mode: summary
+    protocol:
+      schema-version: v1
+
+  # 会话记忆：Redis 滑动窗口 + DB 摘要 + 发件箱异步合并
+  memory:
+    chat-window-size: 20
+    summary-chunk-messages: 10
+    summary-trigger-user-every: 5
+    summary-llm-temperature: 0.2
+    cache-ttl-hours: 24
+    profile:
+      session-update-every-user-messages: 10
+      session-min-user-messages: 10
+      user-phrases-max-total: 12
+      user-phrases-max-per-bucket: 4
+
+  # 充值订单：补偿扫描（MQ TTL/死信丢失、消费失败时仍停留在待支付的订单）
+  recharge:
+    stuck-scan:
+      enabled: true
+      # 上一轮结束后间隔再触发，避免堆积
+      fixed-delay-ms: 300000
+      # 比 TTL 队列 15min 略大，减少与正常 MQ 取消路径重复处理
+      min-age-minutes: 18
+      batch-size: 40
+      lock-wait-seconds: 0
+      lock-lease-minutes: 10
+      # 全局节流：距 Redis 中上次成功扫描不足该毫秒则跳过（0 表示关闭）
+      min-interval-since-last-run-ms: 0
+
 spring:
   data:
     redis:
